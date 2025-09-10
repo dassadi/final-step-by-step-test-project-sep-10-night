@@ -7,7 +7,7 @@ Parameters:
     Description: S3 bucket name where Glue scripts will be stored (must already be unique).
   RawBucketName:
     Type: String
-    Description: Raw data bucket (S3). Example: my-raw-bucket-dev
+    Description: "Raw data bucket (S3). Example: my-raw-bucket-dev"
   CuratedBucketName:
     Type: String
     Description: Curated bucket (S3) - Iceberg warehouse root will be created here.
