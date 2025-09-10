@@ -1,0 +1,264 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Glue ETL (S3 -> Iceberg) orchestrated by Step Functions. Lambda will trigger Step Function on input/_SUCCESS.
+
+Parameters:
+  ScriptsBucketName:
+    Type: String
+    Description: S3 bucket name where Glue scripts will be stored (must already be unique).
+  RawBucketName:
+    Type: String
+    Description: Raw data bucket (S3). Example: my-raw-bucket-dev
+  CuratedBucketName:
+    Type: String
+    Description: Curated bucket (S3) - Iceberg warehouse root will be created here.
+  GlueJobName:
+    Type: String
+    Default: s3-to-iceberg-job
+  StateMachineName:
+    Type: String
+    Default: run-glue-state-machine
+  LambdaFunctionName:
+    Type: String
+    Default: s3-success-trigger
+
+Resources:
+
+  ## S3 buckets
+  ScriptsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref ScriptsBucketName
+
+  RawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref RawBucketName
+
+  CuratedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref CuratedBucketName
+
+  ## IAM role for Glue
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${GlueJobName}-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueS3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${RawBucket}/*"
+                  - !Sub "arn:aws:s3:::${CuratedBucket}/*"
+                  - !Sub "arn:aws:s3:::${ScriptsBucket}/*"
+              - Effect: Allow
+                Action:
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:GetTable
+                  - glue:GetDatabase
+                  - glue:CreateDatabase
+                  - glue:GetPartition
+                  - glue:BatchCreatePartition
+                Resource: "*"
+
+  ## Glue Job
+  GlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Ref GlueJobName
+      Role: !GetAtt GlueServiceRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${ScriptsBucketName}/scripts/s3_to_iceberg.py"
+        PythonVersion: "3"
+      DefaultArguments:
+        "--TempDir": !Sub "s3://${CuratedBucketName}/tmp/"
+        "--raw_bucket": !Ref RawBucketName
+        "--curated_bucket": !Ref CuratedBucketName
+        "--job-language": "python"
+      GlueVersion: "4.0"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+
+  ## IAM role for Step Functions (allows invoking Glue)
+  StepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StateMachineName}-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionGluePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                Resource:
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${GlueJobName}"
+
+  ## State Machine
+  GlueStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Ref StateMachineName
+      RoleArn: !GetAtt StepFunctionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Run Glue ETL job and fail on error",
+          "StartAt": "StartGlueJob",
+          "States": {
+            "StartGlueJob": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "${GlueJobName}",
+                "Arguments": {
+                  "--raw_bucket.$": "$.raw_bucket",
+                  "--curated_bucket.$": "$.curated_bucket"
+                }
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["Glue.JobRunException", "Glue.JobRunStateError"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "FailState"
+                }
+              ],
+              "End": true
+            },
+            "FailState": {
+              "Type": "Fail",
+              "Cause": "Glue job failed"
+            }
+          }
+        }
+
+  ## IAM role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${LambdaFunctionName}-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref GlueStateMachine
+
+  ## Lambda function (will start Step Function on _SUCCESS)
+  S3SuccessWatcher:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 20
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref GlueStateMachine
+          CURATED_BUCKET: !Ref CuratedBucketName
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import time
+          import boto3
+
+          sf = boto3.client('stepfunctions')
+
+          def lambda_handler(event, context):
+              print("Received event:", json.dumps(event))
+              # S3 event -> iterate records
+              for rec in event.get('Records', []):
+                  s3 = rec.get('s3', {})
+                  bucket = s3.get('bucket', {}).get('name')
+                  key = s3.get('object', {}).get('key')
+                  if not (bucket and key):
+                      continue
+                  # Only react to _SUCCESS objects (you can change condition)
+                  if key.endswith('_SUCCESS') or key.endswith('/_SUCCESS'):
+                      payload = {
+                          "raw_bucket": bucket,
+                          "curated_bucket": os.environ.get('CURATED_BUCKET'),
+                          "s3_key": key
+                      }
+                      exec_name = "exec-" + str(int(time.time() * 1000))
+                      resp = sf.start_execution(
+                          stateMachineArn=os.environ.get('STATE_MACHINE_ARN'),
+                          name=exec_name,
+                          input=json.dumps(payload)
+                      )
+                      print("Started StepFunctions execution:", resp)
+              return {"statusCode": 200}
+
+Outputs:
+  ScriptsBucket:
+    Description: "S3 bucket for scripts"
+    Value: !Ref ScriptsBucketName
+  RawBucket:
+    Description: "Raw data bucket"
+    Value: !Ref RawBucketName
+  CuratedBucket:
+    Description: "Curated bucket (Iceberg warehouse root)"
+    Value: !Ref CuratedBucketName
+  GlueJobNameOut:
+    Description: "Glue Job name"
+    Value: !Ref GlueJobName
+  StateMachineArn:
+    Description: "ARN of the Step Functions state machine"
+    Value: !Ref GlueStateMachine
+  LambdaFunctionArn:
+    Description: "ARN of the Lambda function"
+    Value: !GetAtt S3SuccessWatcher.Arn
