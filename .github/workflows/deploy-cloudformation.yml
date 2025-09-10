@@ -23,5 +23,5 @@ jobs:
           aws cloudformation deploy \
             --stack-name my-glue-iceberg-stack \
             --template-file glue-iceberg-stack.yaml \
-            --parameter-overrides ScriptsBucketName=my-scripts-bucket RawBucketName=my-raw-bucket CuratedBucketName=my-curated-bucket \
+            --parameter-overrides ScriptsBucketName=fix-scripts-bucket-sep11-midnight RawBucketName=fix-raw-bucket-sep11-midnight CuratedBucketName=fix-curated-bucket-sep11-midnight \
             --capabilities CAPABILITY_NAMED_IAM
