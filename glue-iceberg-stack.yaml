@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Glue ETL (S3 -> Iceberg) orchestrated by Step Functions. Lambda will trigger Step Function on input/_SUCCESS.
+Description: Glue ETL (S3 -> Iceberg) orchestrated by Step Function. Lambda will trigger Step Function on input/_SUCCESS.
 
 Parameters:
   ScriptsBucketName:
